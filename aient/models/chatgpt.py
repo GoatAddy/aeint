@@ -6,6 +6,7 @@ import httpx
 import asyncio
 import logging
 import inspect
+from collections import defaultdict
 from typing import Union, Optional, Callable
 
 from .base import BaseLLM
@@ -15,6 +16,21 @@ from ..utils.scripts import safe_get, async_generator_to_sync, parse_function_xm
 from ..core.request import prepare_request_payload
 from ..core.response import fetch_response_stream, fetch_response
 from ..architext.architext import Messages, SystemMessage, UserMessage, AssistantMessage, ToolCalls, ToolResults, Texts, RoleMessage, Images, Files
+
+class ToolResult(Texts):
+    def __init__(self, tool_name: str, tool_args: str, tool_response: str, name: Optional[str] = None, visible: bool = True, newline: bool = True):
+        super().__init__(text=tool_response, name=name or f"tool_result_{tool_name}", visible=visible, newline=newline)
+        self.tool_name = tool_name
+        self.tool_args = tool_args
+
+    async def render(self) -> Optional[str]:
+        tool_response = await super().render()
+        if tool_response is None:
+            tool_response = ""
+        if self.tool_args:
+            return f"[{self.tool_name}({self.tool_args}) Result]:\n\n{tool_response}"
+        else:
+            return f"[{self.tool_name} Result]:\n\n{tool_response}"
 
 class APITimeoutError(Exception):
     """Custom exception for API timeout errors."""
@@ -73,8 +89,8 @@ class chatgpt(BaseLLM):
     def __init__(
         self,
         api_key: str = None,
-        engine: str = os.environ.get("GPT_ENGINE") or "gpt-4o",
-        api_url: str = (os.environ.get("API_URL") or "https://api.openai.com/v1/chat/completions"),
+        engine: str = os.environ.get("MODEL") or "gpt-4o",
+        api_url: str = (os.environ.get("BASE_URL") or "https://api.openai.com/v1/chat/completions"),
         system_prompt: str = "You are ChatGPT, a large language model trained by OpenAI. Respond conversationally",
         proxy: str = None,
         timeout: float = 600,
@@ -92,27 +108,30 @@ class chatgpt(BaseLLM):
         cache_messages: list = None,
         logger: logging.Logger = None,
         check_done: bool = False,
+        retry_count: int = 999999,
     ) -> None:
         """
         Initialize Chatbot with API key (from https://platform.openai.com/account/api-keys)
         """
         super().__init__(api_key, engine, api_url, system_prompt, proxy, timeout, max_tokens, temperature, top_p, presence_penalty, frequency_penalty, reply_count, truncate_limit, use_plugins=use_plugins, print_log=print_log)
-        self.conversation: dict[str, Messages] = {
-            "default": Messages(SystemMessage(self.system_prompt)),
-        }
+        self.conversation: dict[str, Messages] = defaultdict(lambda: Messages(SystemMessage(self.system_prompt)))
         if cache_messages:
             self.conversation["default"] = cache_messages
         self.function_calls_counter = {}
         self.function_call_max_loop = function_call_max_loop
         self.check_done = check_done
-
+        self.retry_count = retry_count
         if logger:
             self.logger = logger
         else:
             # 如果没有提供 logger，创建一个默认的，它只会打印到控制台
             self.logger = logging.getLogger("chatgpt_default")
+            self.logger.propagate = False
             if not self.logger.handlers: # 防止重复添加 handler
-                self.logger.addHandler(logging.StreamHandler())
+                handler = logging.StreamHandler()
+                formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+                handler.setFormatter(formatter)
+                self.logger.addHandler(handler)
                 self.logger.setLevel(logging.INFO if print_log else logging.WARNING)
 
         # 注册和处理传入的工具
@@ -173,8 +192,8 @@ class chatgpt(BaseLLM):
                 self.conversation[convo_id].append(ToolCalls(tool_calls))
                 self.conversation[convo_id].append(ToolResults(tool_call_id=function_call_id, content=message))
             else:
-                last_user_message = self.conversation[convo_id][-1]["content"]
-                if last_user_message != message:
+                last_user_message = self.conversation[convo_id][-1]
+                if last_user_message != UserMessage(message):
                     image_message_list = UserMessage()
                     if isinstance(function_arguments, str):
                         functions_list = json.loads(function_arguments)
@@ -268,7 +287,7 @@ class chatgpt(BaseLLM):
             "messages": await self.conversation[convo_id].render_latest() if pass_history else Messages(
                 SystemMessage(self.system_prompt, self.conversation[convo_id].provider("files")),
                 UserMessage(prompt)
-            ),
+            ).render(),
             "stream": stream,
             "temperature": kwargs.get("temperature", self.temperature)
         }
@@ -417,7 +436,7 @@ class chatgpt(BaseLLM):
             for chunk in process_sync():
                 yield chunk
 
-        if not full_response.strip():
+        if not full_response.strip() and not need_function_call:
             raise EmptyResponseError("Response is empty")
 
         if self.print_log:
@@ -476,7 +495,9 @@ class chatgpt(BaseLLM):
                 # 删除 task_complete 跟其他工具一起调用的情况，因为 task_complete 必须单独调用
                 if len(function_parameter) > 1:
                     function_parameter = [tool_dict for tool_dict in function_parameter if tool_dict.get("function_name", "") != "task_complete"]
-                    function_parameter = [tool_dict for tool_dict in function_parameter if tool_dict.get("function_name", "") != "get_task_result"]
+                    # 仅当存在其他工具时，才删除 get_task_result
+                    if any(tool.get("function_name") != "get_task_result" for tool in function_parameter):
+                        function_parameter = [tool_dict for tool_dict in function_parameter if tool_dict.get("function_name", "") != "get_task_result"]
                 if len(function_parameter) == 1 and function_parameter[0].get("function_name", "") == "task_complete":
                     raise TaskComplete(safe_get(function_parameter, 0, "parameter", "message", default="The task has been completed."))
 
@@ -563,7 +584,7 @@ class chatgpt(BaseLLM):
                 tool_calls = function_parameter
 
             # 处理所有工具调用
-            all_responses = []
+            all_responses = UserMessage()
 
             for tool_info in tool_calls:
                 tool_name = tool_info['function_name']
@@ -583,27 +604,28 @@ class chatgpt(BaseLLM):
                             tool_response = chunk.replace("function_response:", "")
                         else:
                             yield chunk
-                if tool_name == "read_file" and "<tool_error>" not in tool_response:
-                    self.conversation[convo_id].provider("files").update(tool_info['parameter']["file_path"], tool_response)
-                    all_responses.append(f"[{tool_name}({tool_args}) Result]:\n\nRead file successfully! The file content has been updated in the tag <latest_file_content>.")
-                elif tool_name == "get_knowledge_graph_tree" and "<tool_error>" not in tool_response:
-                    self.conversation[convo_id].provider("knowledge_graph").visible = True
-                    all_responses.append(f"[{tool_name}({tool_args}) Result]:\n\nGet knowledge graph tree successfully! The knowledge graph tree has been updated in the tag <knowledge_graph_tree>.")
-                elif tool_name == "write_to_file" and "<tool_error>" not in tool_response:
-                    all_responses.append(f"[{tool_name} Result]:\n\n{tool_response}")
-                elif tool_name == "read_image" and "<tool_error>" not in tool_response:
-                    tool_info["base64_image"] = tool_response
-                    all_responses.append(f"[{tool_name}({tool_args}) Result]:\n\nRead image successfully!")
-                elif tool_response.startswith("data:image/") and ";base64," in tool_response and "<tool_error>" not in tool_response:
-                    tool_info["base64_image"] = tool_response
-                    all_responses.append(f"[{tool_name}({tool_args}) Result]:\n\nRead image successfully!")
-                else:
-                    all_responses.append(f"[{tool_name}({tool_args}) Result]:\n\n{tool_response}")
+                final_tool_response = tool_response
+                if "<tool_error>" not in tool_response:
+                    if tool_name == "read_file":
+                        self.conversation[convo_id].provider("files").update(tool_info['parameter']["file_path"], tool_response)
+                        final_tool_response = "Read file successfully! The file content has been updated in the tag <latest_file_content>."
+                    elif tool_name == "get_knowledge_graph_tree":
+                        self.conversation[convo_id].provider("knowledge_graph").visible = True
+                        final_tool_response = "Get knowledge graph tree successfully! The knowledge graph tree has been updated in the tag <knowledge_graph_tree>."
+                    elif tool_name == "write_to_file":
+                        tool_args = None
+                    elif tool_name == "read_image":
+                        tool_info["base64_image"] = tool_response
+                        final_tool_response = "Read image successfully!"
+                    elif tool_response.startswith("data:image/") and ";base64," in tool_response:
+                        tool_info["base64_image"] = tool_response
+                        final_tool_response = "Read image successfully!"
+                all_responses.append(ToolResult(tool_name, tool_args, final_tool_response))
 
             # 合并所有工具响应
-            function_response = "\n\n".join(all_responses).strip()
+            function_response = all_responses
             if missing_required_params:
-                function_response += "\n\n" + "\n\n".join(missing_required_params)
+                function_response.append(Texts("\n\n".join(missing_required_params)))
 
             # 使用第一个工具的名称和参数作为历史记录
             function_call_name = tool_calls[0]['function_name']
@@ -638,17 +660,6 @@ class chatgpt(BaseLLM):
             self.add_to_conversation(full_response, response_role, convo_id=convo_id, total_tokens=total_tokens, pass_history=pass_history)
             self.function_calls_counter = {}
 
-            # 清理翻译引擎相关的历史记录
-            if pass_history <= 2 and len(self.conversation[convo_id]) >= 2 \
-            and (
-                "You are a translation engine" in self.conversation[convo_id][-2]["content"] \
-                or "You are a translation engine" in safe_get(self.conversation, convo_id, -2, "content", 0, "text", default="") \
-                or "你是一位精通简体中文的专业翻译" in self.conversation[convo_id][-2]["content"] \
-                or "你是一位精通简体中文的专业翻译" in safe_get(self.conversation, convo_id, -2, "content", 0, "text", default="")
-            ):
-                self.conversation[convo_id].pop(-1)
-                self.conversation[convo_id].pop(-1)
-
     async def _ask_stream_handler(
         self,
         prompt: list,
@@ -671,7 +682,7 @@ class chatgpt(BaseLLM):
         # 准备会话
         self.system_prompt = system_prompt or self.system_prompt
         if convo_id not in self.conversation or pass_history <= 2:
-            self.reset(convo_id=convo_id, system_prompt=system_prompt)
+            self.reset(convo_id=convo_id, system_prompt=self.system_prompt)
         self.add_to_conversation(prompt, role, convo_id=convo_id, function_name=function_name, total_tokens=total_tokens, function_arguments=function_arguments, pass_history=pass_history, function_call_id=function_call_id)
 
         # 获取请求体
@@ -687,7 +698,8 @@ class chatgpt(BaseLLM):
         # 发送请求并处理响应
         retry_times = 0
         error_to_raise = None
-        while True:
+        while retry_times < self.retry_count:
+            retry_times += 1
             tmp_post_json = copy.deepcopy(json_post)
             if need_done_prompt:
                 tmp_post_json["messages"].extend(need_done_prompt)
@@ -800,8 +812,7 @@ class chatgpt(BaseLLM):
                     error_message = "您输入了无效的API URL，请使用正确的URL并使用`/start`命令重新设置API URL。具体错误如下：\n\n" + str(e)
                     raise ConfigurationError(error_message)
                 # 最后一次重试失败，向上抛出异常
-                retry_times += 1
-                if retry_times == 9:
+                if retry_times == self.retry_count:
                     raise RetryFailedError(str(e))
 
         if error_to_raise:
@@ -928,7 +939,7 @@ class chatgpt(BaseLLM):
         """
         self.system_prompt = system_prompt or self.system_prompt
         self.conversation[convo_id] = Messages(
-            SystemMessage(Texts("system_prompt", self.system_prompt), self.conversation[convo_id].provider("files")),
+            SystemMessage(self.system_prompt, self.conversation[convo_id].provider("files")),
         )
         self.tokens_usage[convo_id] = 0
         self.current_tokens[convo_id] = 0
